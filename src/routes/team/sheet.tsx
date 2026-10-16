@@ -3,6 +3,7 @@ import { customFetch } from "@api/fetcher";
 import {
   useCreateItemWish,
   useDeleteItemWish,
+  useFile,
   useGetEventStatus,
   useGetTeamSheet,
   useGetUser,
@@ -27,7 +28,7 @@ import { ColumnDef } from "@components/table/react-table-shim";
 import { GlobalStateContext } from "@utils/context-provider";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import {
   CheckIcon,
   ChevronDownIcon,
@@ -51,6 +52,9 @@ import {
 } from "@mytypes/roles";
 import {
   decodePoBExport,
+  DetectedSkills,
+  detectSkills,
+  findFoulbornMod,
   isTreeSocketedSlot,
   Item,
   PathOfBuilding,
@@ -170,6 +174,9 @@ function RouteComponent() {
     eventStatus?.team_id,
   );
   const qc = useQueryClient();
+  const { data: foulbornEntries = [] } = useFile<
+    { name: string; mod: string }[]
+  >("/assets/poe1/items/foulborn_uniques.json");
   const { saveMyTeamSheetEntry } = useSaveMyTeamSheetEntry(currentEvent.id, qc);
   const { wishlist = [] } = useGetWishlist(
     currentEvent.id,
@@ -178,9 +185,9 @@ function RouteComponent() {
   const myUniqueWishes = wishlist.filter(
     (w) => w.user_id === user?.id && w.item_field === ItemField.NAME,
   );
-  const myGemWishCount = wishlist.filter(
+  const myGemWishes = wishlist.filter(
     (w) => w.user_id === user?.id && w.item_field === ItemField.BASE_TYPE,
-  ).length;
+  );
   const { saveItemWish } = useCreateItemWish(
     qc,
     currentEvent.id,
@@ -205,8 +212,10 @@ function RouteComponent() {
   const [mainRoleChartExpanded, setMainRoleChartExpanded] = useState(
     () => localStorage.getItem("mainRoleChartExpanded") === "true",
   );
-  const [detectingUniques, setDetectingUniques] = useState(false);
-  const [detectUniquesStatus, setDetectUniquesStatus] = useState("");
+  const [detectingBuild, setDetectingBuild] = useState(false);
+  const [detectBuildStatus, setDetectBuildStatus] = useState("");
+  const [detectSkillsStatus, setDetectSkillsStatus] = useState("");
+  const detectedGems = useRef<string[]>([]);
   // Only the slice of a decoded PoB build the item-set picker actually
   // needs - not the full PathOfBuilding (raw export string, skill tree,
   // passive nodes, ...), which would otherwise sit in state for as long as
@@ -253,6 +262,10 @@ function RouteComponent() {
       ? `Character name must begin with ${requiredNamePrefix}`
       : null;
 
+  const detectStatus = [detectBuildStatus, detectSkillsStatus]
+    .filter(Boolean)
+    .join(" ");
+
   useEffect(() => {
     localStorage.setItem(
       "mainRoleChartExpanded",
@@ -274,7 +287,12 @@ function RouteComponent() {
     // currently selected - if it changed away from a transfigured gem (to a
     // different one, or to a plain/no gem), the stale wish for the old one
     // must go, not linger on the wishlist forever.
-    if (oldSkill && oldSkill !== newSkill && isTransfiguredGem(oldSkill)) {
+    if (
+      oldSkill &&
+      oldSkill !== newSkill &&
+      isTransfiguredGem(oldSkill) &&
+      !detectedGems.current.includes(oldSkill)
+    ) {
       const staleWish = wishlist.find(
         (w) =>
           w.user_id === user?.id &&
@@ -368,10 +386,11 @@ function RouteComponent() {
     }
   };
 
-  const applyDetectedUniques = (detectedNames: string[]) => {
-    const unique = Array.from(new Set(detectedNames));
-    if (unique.length === 0) {
-      setDetectUniquesStatus("No uniques found in that PoB code.");
+  const applyDetectedUniques = (
+    detected: { value: string; extra: string }[],
+  ) => {
+    if (detected.length === 0) {
+      setDetectBuildStatus("No uniques found in that PoB code.");
       return;
     }
     const existing = wishlist.filter(
@@ -387,20 +406,25 @@ function RouteComponent() {
       });
     }
     let added = 0;
-    for (const name of unique) {
-      const key = JSON.stringify([name, ""]);
+    for (const { value, extra } of detected) {
+      const key = JSON.stringify([value, extra]);
       if (!merged.has(key)) {
+        // Foulborn wishes saved before the mod could be detected have no `extra`
+        // and match no row in the picker, so drop them in favor of this one.
+        const staleKey = JSON.stringify([value, ""]);
+        const stale = extra ? merged.get(staleKey) : undefined;
+        merged.delete(staleKey);
         merged.set(key, {
-          value: name,
-          extra: "",
-          buildEnabling: DEFAULT_BUILD_ENABLING,
-          quantity: 1,
+          value,
+          extra,
+          buildEnabling: stale?.buildEnabling ?? DEFAULT_BUILD_ENABLING,
+          quantity: stale?.quantity ?? 1,
         });
         added++;
       }
     }
     handleUniquesConfirm(Array.from(merged.values()));
-    setDetectUniquesStatus(
+    setDetectBuildStatus(
       added > 0
         ? `Added ${added} unique${added === 1 ? "" : "s"} to Uniques Needed.`
         : "All detected uniques were already on the list.",
@@ -421,14 +445,50 @@ function RouteComponent() {
             (isTreeSocketedSlot(item.slot) ||
               item.equippedInSetIds.some((id) => selected.has(id))),
         )
-        .map((item) => item.name),
+        .map((item) => ({
+          value: item.name,
+          extra: findFoulbornMod(item, foulbornEntries),
+        })),
     );
   };
 
-  const handleDetectUniques = async () => {
+  const applyDetectedSkills = ({
+    mainSkill,
+    transfiguredGems,
+  }: DetectedSkills) => {
+    if (mainSkill) {
+      setForm((f) => ({ ...f, main_skill: mainSkill }));
+    }
+    detectedGems.current = transfiguredGems;
+    const owned = new Set(myGemWishes.map((w) => w.value));
+    const missing = transfiguredGems.filter((gem) => !owned.has(gem));
+    for (const value of missing) {
+      saveItemWish({
+        item_field: ItemField.BASE_TYPE,
+        value,
+        build_enabling: DEFAULT_BUILD_ENABLING,
+        quantity: 1,
+      });
+    }
+    const parts = [];
+    if (mainSkill) parts.push(`Main skill set to ${mainSkill}.`);
+    if (missing.length > 0) {
+      parts.push(
+        `Added ${missing.length} transfigured gem${missing.length === 1 ? "" : "s"}.`,
+      );
+    } else if (transfiguredGems.length > 0) {
+      parts.push("All transfigured gems were already on the list.");
+    } else {
+      parts.push("No transfigured gems found.");
+    }
+    setDetectSkillsStatus(parts.join(" "));
+  };
+
+  const handleDetectBuild = async () => {
     if (!form.pob_url) return;
-    setDetectingUniques(true);
-    setDetectUniquesStatus("");
+    setDetectingBuild(true);
+    setDetectBuildStatus("");
+    setDetectSkillsStatus("");
     try {
       const trimmed = form.pob_url.trim();
       // Share links (Maxroll, pobb.in, etc.) need resolving to the raw
@@ -440,7 +500,9 @@ function RouteComponent() {
             { method: "GET" },
           )
         : trimmed;
-      const { items, itemSets } = await decodePoBExport(pobCode);
+      const pob = await decodePoBExport(pobCode);
+      applyDetectedSkills(detectSkills(pob));
+      const { items, itemSets } = pob;
       if (itemSets.length > 1) {
         // Let the user choose which item set(s) to scan instead of silently
         // assuming the one PoB has active - a build can have several (e.g.
@@ -453,11 +515,11 @@ function RouteComponent() {
         itemSets.map((set) => set.id),
       );
     } catch {
-      setDetectUniquesStatus(
+      setDetectBuildStatus(
         "Couldn't read that as a PoB export code or a supported share link (Maxroll, pobb.in, pob.codes, PoE Ninja, Pastebin.com, PastebinP.com, Rentry.co, poedb.tw).",
       );
     } finally {
-      setDetectingUniques(false);
+      setDetectingBuild(false);
     }
   };
 
@@ -919,7 +981,7 @@ function RouteComponent() {
                 PoB
                 <span
                   className="tooltip"
-                  data-tip="To use Detect uniques, paste your raw PoB export code, or a share link from Maxroll, pobb.in, pob.codes, PoE Ninja, Pastebin.com, PastebinP.com, Rentry.co, or poedb.tw."
+                  data-tip="To use Detect build, paste your raw PoB export code, or a share link from Maxroll, pobb.in, pob.codes, PoE Ninja, Pastebin.com, PastebinP.com, Rentry.co, or poedb.tw."
                 >
                   <QuestionMarkCircleIcon className="size-4 text-base-content/60" />
                 </span>
@@ -936,14 +998,14 @@ function RouteComponent() {
                 <button
                   type="button"
                   className="btn btn-xs"
-                  disabled={!form.pob_url || detectingUniques}
-                  onClick={handleDetectUniques}
+                  disabled={!form.pob_url || detectingBuild}
+                  onClick={handleDetectBuild}
                 >
-                  {detectingUniques ? "Detecting..." : "Detect uniques"}
+                  {detectingBuild ? "Detecting..." : "Detect build"}
                 </button>
-                {detectUniquesStatus && (
+                {detectStatus && (
                   <span className="text-xs text-base-content/60">
-                    {detectUniquesStatus}
+                    {detectStatus}
                   </span>
                 )}
               </div>
@@ -979,8 +1041,8 @@ function RouteComponent() {
                   Pick gems...
                 </button>
                 <span className="text-sm text-base-content/60">
-                  {myGemWishCount
-                    ? `${myGemWishCount} picked`
+                  {myGemWishes.length
+                    ? `${myGemWishes.length} picked`
                     : "none picked yet"}
                 </span>
               </div>
